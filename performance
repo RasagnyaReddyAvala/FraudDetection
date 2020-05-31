@@ -1,0 +1,167 @@
+---
+title: "Project"
+author: "Rasagnya"
+date: "March 28, 2019"
+output:
+  word_document: default
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r,message=FALSE}
+library(data.table)
+library(caret)
+library(xgboost)
+library(fasttime)
+
+```
+```{r}
+rm(train)
+rm(test)
+data_full <- fread("/home/avala/Downloads/data/train.csv/mnt/ssd/kaggle-talkingdata2/competition_files/train.csv", drop = c("attributed_time"), showProgress=F)[(.N - 50e6):.N] 
+
+set.seed(500)
+train_index <- sample(c(1:dim(data_full)[1]),dim(data_full)[1]*0.6)
+train<- data_full[train_index,]
+test <- data_full[-train_index,]
+table(train$is_attributed)
+#find the propotion in percentage
+round(prop.table(table(train$is_attributed)*100),digits = 3)
+#perking into the test data set.
+table((test$is_attributed))
+#propotionate
+round(prop.table(table(test$is_attributed)*100),digits = 3)
+```
+This shows that data is imbalanced
+#Data Processing and Feature Engineering :
+```{r}
+# data without the feature engineering:
+str(train)
+#test data without feature engineering:
+str(test)
+```
+#number of rows in each data set :
+```{r}
+print("train")
+nrow(train)
+print("test")
+nrow(test)
+
+```
+#best way to feature engineering is to combine both the test and train data set.
+```{r, warning=FALSE}
+# we make use of the fasttime library to engineer time data:
+# the value to be predicted is the ~~ is_attributed of the train data set
+y <- train$is_attributed
+ty <- test$is_attributed
+#make a copy of the train data set for further training before combining 
+copy_train <- 1:nrow(train)
+#combine both training and testing data set
+train_test <- rbind(train, test, fill = T)
+#remove memory to free up the ram 
+#rm(train, test); gc()
+# feature engineering
+train_test [, `:=`(hour = hour(click_time), min = minute(click_time), click_time = fastPOSIXct(click_time))
+            ][, next_clk := as.integer(click_time - shift(click_time))
+                ][, click_time := NULL
+                    ][, ip_f := .N, by = "ip"
+                        ][, app_f := .N, by = "app"
+                            ][, channel_f := .N, by = "channel"
+                                      ][, device_f := .N, by = "device"
+                                            ][, os_f := .N, by = "os"
+                                                ][, app_f := .N, by = "app"
+                                                ][, ip_app_f := .N, by = "ip,app"
+                                                      ][, ip_dev_f := .N, by = "ip,device"
+                                                                  ][, ip_os_f := .N, by = "ip,os"
+                                                                        ][, ip_chan_f := .N, by = "ip,channel"
+                                                                                  ][, c("ip", "is_attributed") := NULL ]
+#convert the click time to hour , minute 
+#---------------------------
+
+
+```
+
+#prepare the data and make partation:
+```{r}
+#delete the train data set from the combined and assign to ntest.
+ntest <- xgb.DMatrix(data = data.matrix(train_test[-copy_train]),label = ty)
+#assign the training data set to train_test
+train_test <- train_test[copy_train]; gc()
+# make the partation in training data set
+copy_train <- caret::createDataPartition(y, p = 0.9, list = F)
+#make a new training data with is_attributed values intact 
+ntrain <- xgb.DMatrix(data = data.matrix(train_test[copy_train]), label = y[copy_train])
+#valuation data set or Testing data set
+nval <- xgb.DMatrix(data = data.matrix(train_test[-copy_train]), label = y[-copy_train])
+cols <- colnames(train_test)
+
+#rm(train_test, y, copy_train); gc()
+
+```
+#train the model with xgboost algorithm
+```{r}
+#setup the tuning parameter
+#nrouds 600 defined.
+#nrounds 2000 took more than 5 hours to execute 
+#at around 600th iteration the maximum auroc was achived and the improvement after that was not significant
+#nrounds: The maximum number of iterations (number of trees in final model).
+#colsample_bytree: The number of features, expressed as a ratio, to sample when building a tree. Default is 1 (100% of the features).
+#min_child_weight: The minimum weight in the trees being boosted. Default is 1.eta: Learning rate, which is the contribution of each tree to the solution. Default is 0.3.
+#gamma: Minimum loss reduction required to make another leaf partition in a tree.subsample: Ratio of data observations. Default is 1 (100%).max_depth: Maximum depth of the individual trees.
+
+list_xgb <- list(objective = "binary:logistic",
+          booster = "gbtree",
+          eval_metric = "auc",
+          nthread = 8,
+          eta = 0.07,
+          max_depth = 4,
+          min_child_weight = 96,
+          gamma = 6.1142,
+          subsample = 1,
+          colsample_bytree = 0.5962,
+          colsample_bylevel = 0.5214,
+          alpha = 0,
+          lambda= 21.0033,
+          max_delta_step = 5.0876,
+          scale_pos_weight = 150,
+          nrounds = 600)
+#training xgb model using the library xgboost 
+m_xgb <- xgb.train(list_xgb, ntrain, list_xgb$nrounds, list(val = nval), print_every_n = 50, early_stopping_rounds = 500)
+#before the final testing 
+#let us check the importance 
+
+(imp <- xgb.importance(cols, model=m_xgb))
+xgb.plot.importance(imp, top_n = 30)
+#examine gain , cover , frequency to get insights from the trained model 
+imp
+#testing with validation data set:
+valid_fit <- round(predict(m_xgb,nval), 6)
+#we use area under roc as the performance metric:
+
+```
+
+
+#testing the data with test
+
+```{r}
+fit_test <- round(predict(m_xgb,ntest), 6)
+```
+
+```{r}
+library(caret)
+fit_test_c <- ifelse(fit_test > 0.5 , 1, 0)
+fit_test_c <- factor(fit_test_c)
+ty<- factor(ty)
+confusionMatrix(fit_test_c , ty)
+```
+
+```{r}
+fit_test_c <- ifelse(fit_test > 0.6 , 1, 0)
+fit_test_c <- factor(fit_test_c)
+#ty<- factor(ty)
+confusionMatrix(fit_test_c , ty)
+```
